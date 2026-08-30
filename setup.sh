@@ -208,8 +208,13 @@ echo "[6/7] Configuring (preset: $PRESET)..."
 # Override the preset's default CMAKE_PREFIX_PATH with the one we just set,
 # so the build picks up the aqtinstall location rather than ~/Qt/6.8.3/...
 EXTRA_ARGS=""
-if [ "$PLATFORM" = "macos" ] && [ -d "/opt/homebrew/opt/openssl@3" ]; then
-    EXTRA_ARGS="-DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3"
+if [ "$PLATFORM" = "macos" ]; then
+    # Resolve the openssl@3 prefix from brew itself rather than hardcoding the
+    # Apple Silicon path — Intel Macs use /usr/local, not /opt/homebrew.
+    OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || true)"
+    if [ -n "$OPENSSL_PREFIX" ] && [ -d "$OPENSSL_PREFIX" ]; then
+        EXTRA_ARGS="-DOPENSSL_ROOT_DIR=$OPENSSL_PREFIX"
+    fi
 fi
 
 cmake --preset "$PRESET" -DCMAKE_PREFIX_PATH="$QT_PREFIX" $EXTRA_ARGS \
