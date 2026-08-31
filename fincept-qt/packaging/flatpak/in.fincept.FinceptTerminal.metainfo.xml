@@ -46,23 +46,23 @@
   <screenshots>
     <screenshot type="default">
       <caption>Dashboard with customizable widget grid</caption>
-      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/main/images/Dashboard.png</image>
+      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/v4.4.1/images/Dashboard.png</image>
     </screenshot>
     <screenshot>
       <caption>Equity research with comprehensive analysis</caption>
-      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/main/images/EquityResearch.png</image>
+      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/v4.4.1/images/EquityResearch.png</image>
     </screenshot>
     <screenshot>
       <caption>Portfolio management and analytics</caption>
-      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/main/images/Portfolio.png</image>
+      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/v4.4.1/images/Portfolio.png</image>
     </screenshot>
     <screenshot>
       <caption>News aggregation from multiple sources</caption>
-      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/main/images/News.png</image>
+      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/v4.4.1/images/News.png</image>
     </screenshot>
     <screenshot>
       <caption>Visual node editor for workflows</caption>
-      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/main/images/NodeEditor.png</image>
+      <image>https://raw.githubusercontent.com/Fincept-Corporation/FinceptTerminal/v4.4.1/images/NodeEditor.png</image>
     </screenshot>
   </screenshots>
 
@@ -71,6 +71,15 @@
   </provides>
 
   <releases>
+    <!-- 4.5.0 is NOT released yet: no v4.4.1-style tag exists for it and
+         updates.json still reports 4.4.1. The Flatpak manifest therefore
+         builds v4.4.1, and the newest release listed here must match what
+         is actually shipped, or Flathub advertises a version whose binary
+         it does not have. Notes kept verbatim: on tagging v4.5.0, delete
+         these two comment lines and bump tag+commit in the manifest.
+    <release version="4.5.0" ...> block below is inert until then.
+    -->
+    <!--
     <release version="4.5.0" date="2026-08-31">
       <description>
         <p>Fixes AI tool calling with Google Gemini. Around 150 tools take a free-form options object, which Gemini's schema cannot express; those tools were being advertised to Gemini as taking no arguments at all, so the assistant could call them but never pass them anything. They now work on Gemini as they already did on other providers.</p>
@@ -79,6 +88,7 @@
         <p>Tool sequences now have a time limit as well as a step limit, and say which one ran out instead of stopping without explanation. Also fixes the AstraFlow and AstraFlow CN providers failing to find their endpoint when the base URL field was cleared.</p>
       </description>
     </release>
+    -->
     <release version="4.4.1" date="2026-08-19">
       <description>
         <p>Adds the TickerAll (MetaTrader 5) broker integration, so MT5 accounts can be linked, funded and traded from the equity trading screen alongside the existing brokers.</p>

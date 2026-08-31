@@ -52,10 +52,17 @@ modules:
       - cmake --build _build --parallel
       - cmake --install _build
     sources:
-      # Main repository
+      # Main repository.
+      # Flathub's linter REQUIRES a commit alongside a tag ("this is an error
+      # for new submissions if a commit is missing with a tag") — tags are
+      # mutable, so the commit is what makes the build reproducible.
+      # Pinned to the latest *released* tag. Bump both fields together on each
+      # release; a tag that does not exist fails the build at source fetch,
+      # which is what v4.5.0 did here before it was ever tagged.
       - type: git
         url: https://github.com/Fincept-Corporation/FinceptTerminal.git
-        tag: v4.5.0
+        tag: v4.4.1
+        commit: 4d169bd4e1a5011ecc1d8befedb8e0d713dbfe3e
       # Vendored FetchContent dependencies (no network during build)
       - type: git
         url: https://github.com/QtExcel/QXlsx.git

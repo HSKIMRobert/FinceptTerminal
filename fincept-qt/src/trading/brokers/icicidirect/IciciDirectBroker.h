@@ -17,14 +17,24 @@ namespace fincept::trading {
 /// DELETE=cancel). Symbol mapping (normal ticker <-> ICICI stock_code, plus F&O
 /// expiry/strike/right decomposition) comes from InstrumentService ("icicidirect").
 ///
-/// Scope (v1): REST only. Live tick streaming (Breeze Socket.IO) is deferred, so
-/// ws_adapter_name() returns "".
+/// Live tick streaming IS supported: IciciDirectWebSocket speaks Breeze's
+/// Socket.IO (Engine.IO v4) transport and is constructed by AccountDataStream
+/// for this broker id. It shipped in the same commit as the REST surface — the
+/// "v1: REST only, streaming deferred" note that used to sit here was stale from
+/// the first release and claimed the opposite of what the code does.
 class IciciDirectBroker : public IBroker {
   public:
     BrokerId id() const override { return BrokerId::IciciDirect; }
     const char* name() const override { return "ICICI Direct"; }
     const char* base_url() const override { return "https://api.icicidirect.com/breezeapi/api/v1"; }
-    const char* ws_adapter_name() const override { return ""; } // streaming deferred
+    // Nothing dispatches on this today — AccountDataStream picks the socket with
+    // a hardcoded `broker_id_ == "..."` chain, and every other broker's adapter
+    // name is likewise unread. Leaving it empty is still wrong: ICICI was the only
+    // broker returning "" while all the others name their adapter, so the day this
+    // accessor becomes the dispatch key, ICICI is the one that silently loses
+    // streaming — and "" would read as a deliberate "no socket" rather than an
+    // oversight.
+    const char* ws_adapter_name() const override { return "icicidirect"; }
 
     BrokerProfile profile() const override {
         return BrokerProfile{

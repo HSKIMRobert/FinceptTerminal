@@ -85,7 +85,8 @@ class TickerAllBroker : public IBroker {
                                                    const QString& resolution, const QString& from_date,
                                                    const QString& to_date) override;
 
-    // Streaming deferred, same as IciciDirectBroker. TickerAll does expose a
+    // Streaming genuinely is deferred here (unlike IciciDirectBroker, whose
+    // socket shipped alongside its REST surface). TickerAll does expose a
     // WebSocket (wss://api.tickerall.com/v1/stream: ticks, positions, orders),
     // and wiring an adapter here is the natural follow-up — it would also let
     // get_quotes() serve real streamed bid/ask instead of the per-symbol M1
