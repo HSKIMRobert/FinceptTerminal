@@ -3,6 +3,7 @@
 #include "mcp/GeminiSchema.h"
 
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonValue>
 #include <QRegularExpression>
 #include <QSet>
@@ -188,9 +189,37 @@ std::optional<QJsonObject> gemini_sanitize(const QJsonObject& in, int depth) {
     if (type == QLatin1String("object")) {
         const QJsonObject props = out.value(QStringLiteral("properties")).toObject();
         // An OBJECT with no properties is rejected outright ("should be
-        // non-empty for OBJECT type"). Signal "drop me" to the caller.
-        if (props.isEmpty())
-            return std::nullopt;
+        // non-empty for OBJECT type"), and Gemini has no `additionalProperties`
+        // with which to say "any keys". So a FREE-FORM object parameter — the
+        // `params` / `config` / `args` / `metadata` bag that ~150 tools in this
+        // catalogue declare — cannot be expressed as an OBJECT at all.
+        //
+        // Dropping it (what this used to do) is not a safe fallback: the tool is
+        // then declared to Gemini as taking no such argument, so the model can
+        // never supply it. For the ~115 tools whose ONLY parameter is such a
+        // bag, the whole `parameters` object collapsed and the tool was
+        // advertised as parameterless — callable, and useless.
+        //
+        // Nested, we substitute a STRING carrying serialised JSON, which is the
+        // one shape Gemini both accepts and lets the model fill with arbitrary
+        // keys. `restore_gemini_call_args` parses it back before dispatch, so
+        // the handler still receives a real object.
+        //
+        // At the top level (depth 0) there is nothing to substitute into:
+        // `parameters` itself must be an OBJECT, so the caller must omit the
+        // field entirely — which is correct there, since a top-level empty
+        // object means a genuinely parameterless tool.
+        if (props.isEmpty()) {
+            if (depth == 0)
+                return std::nullopt;
+            QString desc = in.value(QStringLiteral("description")).toString().trimmed();
+            if (!desc.isEmpty() && !desc.endsWith(QLatin1Char('.')))
+                desc += QLatin1Char('.');
+            desc += QStringLiteral(" Pass a JSON object serialised as a string, e.g. "
+                                   "\"{\\\"key\\\": \\\"value\\\"}\".");
+            return QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
+                               {QStringLiteral("description"), desc.trimmed()}};
+        }
 
         // `required` may only name properties that survived sanitisation —
         // a required-but-absent name is itself a validation error.
@@ -213,6 +242,76 @@ std::optional<QJsonObject> sanitize_schema_for_gemini(const QJsonObject& schema)
     if (schema.isEmpty())
         return std::nullopt;
     return gemini_sanitize(schema, 0);
+}
+
+namespace {
+
+// One value, coerced against the type its schema declares. `depth` guards a
+// self-referential schema the same way the sanitiser does.
+QJsonValue gemini_restore_value(const QJsonValue& value, const QJsonObject& schema, int depth);
+
+QJsonObject gemini_restore_object(const QJsonObject& args, const QJsonObject& schema, int depth) {
+    const QJsonObject props = schema.value(QStringLiteral("properties")).toObject();
+    if (props.isEmpty() || depth > 12)
+        return args;
+    QJsonObject out = args;
+    for (auto it = args.constBegin(); it != args.constEnd(); ++it) {
+        const QJsonValue decl = props.value(it.key());
+        if (!decl.isObject())
+            continue;
+        out[it.key()] = gemini_restore_value(it.value(), decl.toObject(), depth + 1);
+    }
+    return out;
+}
+
+QJsonValue gemini_restore_value(const QJsonValue& value, const QJsonObject& schema, int depth) {
+    if (depth > 12)
+        return value;
+    const QString type = gemini_normalise_type(schema.value(QStringLiteral("type")));
+
+    if (type == QLatin1String("object")) {
+        if (value.isObject())
+            return gemini_restore_object(value.toObject(), schema, depth);
+        if (value.isString()) {
+            // The surrogate round-trip. An empty string means "not supplied" —
+            // returning it unchanged lets the validator speak for itself.
+            const QJsonDocument doc = QJsonDocument::fromJson(value.toString().toUtf8());
+            if (doc.isObject())
+                return gemini_restore_object(doc.object(), schema, depth);
+        }
+        return value;
+    }
+
+    if (type == QLatin1String("array")) {
+        QJsonArray arr;
+        if (value.isArray()) {
+            arr = value.toArray();
+        } else if (value.isString()) {
+            const QJsonDocument doc = QJsonDocument::fromJson(value.toString().toUtf8());
+            if (!doc.isArray())
+                return value;
+            arr = doc.array();
+        } else {
+            return value;
+        }
+        const QJsonValue items = schema.value(QStringLiteral("items"));
+        if (!items.isObject())
+            return arr;
+        QJsonArray out;
+        for (const auto& e : arr)
+            out.append(gemini_restore_value(e, items.toObject(), depth + 1));
+        return out;
+    }
+
+    return value;
+}
+
+} // namespace
+
+QJsonObject restore_gemini_call_args(const QJsonObject& original_schema, const QJsonObject& args) {
+    if (original_schema.isEmpty() || args.isEmpty())
+        return args;
+    return gemini_restore_object(args, original_schema, 0);
 }
 
 bool is_valid_gemini_function_name(const QString& name) {

@@ -18,18 +18,28 @@
 
 #include "core/config/AppConfig.h"
 #include "core/logging/Logger.h"
+#include "mcp/McpProvider.h"
+#include "mcp/McpService.h"
 #include "mcp/McpTypes.h"
 #include "mcp/ResultStore.h"
+#include "mcp/TerminalMcpBridge.h"
 #include "services/llm/LlmService.h"
 
+#include <QElapsedTimer>
+#include <QFuture>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSet>
 #include <QString>
 
+#include <QtConcurrent>
+
 #include <algorithm>
+#include <cstddef>
 #include <functional>
+#include <utility>
+#include <vector>
 
 namespace fincept::ai_chat::detail {
 
@@ -250,6 +260,77 @@ inline QString encode_tool_result_for_llm(const QString& tool_name, const mcp::T
 // capped at 20 and defaults to 5) while keeping the tail bounded.
 inline constexpr int kMaxActivatedTools = 24;
 
+// —— Tool-loop budget ———
+//
+// `max_tool_rounds` bounds how many times the loop iterates, which is not the
+// same as bounding how long it runs. One round can start a 300 s background
+// job and long-poll it for 30 s, so the default 40 rounds is, in wall-clock
+// terms, unbounded — and the user watching a chat bubble has no way to tell a
+// working turn from a wedged one. The two budgets answer different questions
+// and a loop needs both: rounds cap the token spend, the deadline caps the
+// wait.
+//
+// Exhausting either is a normal outcome, not an error, but it must be VISIBLE.
+// The loop used to stop and hand back whatever it had, so a turn that ran out
+// of budget mid-task was indistinguishable from one that finished — the same
+// failure shape as a silently truncated tool result (see §M4).
+
+/// Wall-clock ceiling for one turn's tool loop, in ms. 0 disables it.
+/// Ten minutes is well past any legitimate interactive turn while still short
+/// enough that a stuck loop surfaces during the session rather than after it.
+inline int tool_loop_deadline_ms() {
+    return std::max(0, AppConfig::instance().get("mcp/tool_loop_deadline_ms", QVariant(600000)).toInt());
+}
+
+class ToolLoopBudget {
+  public:
+    explicit ToolLoopBudget(int max_rounds) : max_rounds_(max_rounds), deadline_ms_(tool_loop_deadline_ms()) {
+        timer_.start();
+    }
+
+    /// Check at the top of every round, before issuing the next request.
+    bool exhausted() const { return reason() != Reason::None; }
+
+    void note_round() { ++rounds_; }
+    int rounds_used() const { return rounds_; }
+    qint64 elapsed_ms() const { return timer_.elapsed(); }
+
+    /// One line naming which budget ran out and what it cost, for the log and
+    /// for the model's final-summary prompt. Empty while the loop is healthy.
+    QString exhaustion_note() const {
+        switch (reason()) {
+            case Reason::Rounds:
+                return QStringLiteral("tool-call budget spent: %1 of %1 rounds used in %2 s")
+                    .arg(rounds_)
+                    .arg(elapsed_ms() / 1000);
+            case Reason::Deadline:
+                return QStringLiteral("time budget spent: %1 s elapsed (limit %2 s) after %3 round(s)")
+                    .arg(elapsed_ms() / 1000)
+                    .arg(deadline_ms_ / 1000)
+                    .arg(rounds_);
+            case Reason::None:
+                break;
+        }
+        return {};
+    }
+
+  private:
+    enum class Reason { None, Rounds, Deadline };
+
+    Reason reason() const {
+        if (max_rounds_ > 0 && rounds_ >= max_rounds_)
+            return Reason::Rounds;
+        if (deadline_ms_ > 0 && timer_.elapsed() >= deadline_ms_)
+            return Reason::Deadline;
+        return Reason::None;
+    }
+
+    QElapsedTimer timer_;
+    int max_rounds_ = 0;
+    int deadline_ms_ = 0;
+    int rounds_ = 0;
+};
+
 /// Insertion-ordered, capped set of tools the model has discovered this turn.
 /// Evicts least-recently-activated first, so a tool the model keeps coming back
 /// to survives while stale candidates from an early search age out.
@@ -302,6 +383,156 @@ inline void note_tool_activations(const QString& bare_tool_name, const QJsonObje
             name = args.value("name").toString();
         activated.add(name);
     }
+}
+
+
+// —— Parallel tool execution ———
+//
+// A model that asks for six quotes emits six tool_calls in ONE assistant turn,
+// and every loop here executed them one after another — six sequential round
+// trips through Python or HTTP for work with no dependency between the calls.
+// The async dispatcher built to fix that (McpService::execute_openai_function_async,
+// "Phase 5 will join these with QtFuture::whenAll") had no callers at all.
+//
+// Two things stop this from being a plain std::transform over a thread pool:
+//
+// 1. ORDER IS OBSERVABLE. `is_destructive` tools mutate terminal state, and a
+//    round of [write_cell, read_cell] means something different if the read
+//    lands first. So a destructive call is a BARRIER: consecutive read-only
+//    calls fan out together, a destructive call runs alone, and the model's
+//    relative ordering is preserved exactly. Rounds that are all reads — the
+//    overwhelmingly common case — parallelise completely; a round with writes
+//    degrades gracefully toward sequential rather than reordering anything.
+//
+// 2. TOOLS READ THREAD-LOCAL STATE. The destructive-tool gate reads
+//    TerminalMcpBridge's thread_local flags, and four report-builder tools read
+//    `t_chat_session_id`. Both default to empty/false on a pool thread, which
+//    would silently reclassify an agent call as a chat call and detach report
+//    tools from their session. Every worker re-establishes both.
+//
+// Results come back index-aligned with the input, so callers append tool
+// messages in the model's original order whatever order they finished in.
+
+/// One tool call from a round, provider-agnostic.
+struct PendingToolCall {
+    QString wire_name;  // "<server>__<tool>", as the model emitted it
+    QString display;    // bare name, for progress lines and activation tracking
+    QJsonObject args;
+    QString call_id;    // tool_call_id / tool_use_id; opaque here, echoed by the caller
+};
+
+/// Max tool calls executed concurrently within one round. 1 restores the old
+/// strictly-sequential behaviour and is the kill switch.
+///
+/// The default is deliberately low. PythonRunner caps itself at 3 concurrent
+/// processes, so a wider fan-out on Python-backed tools just moves the queue
+/// rather than shortening it, while still multiplying peak memory.
+inline int tool_fanout() {
+    return std::clamp(AppConfig::instance().get("mcp/tool_fanout", QVariant(4)).toInt(), 1, 16);
+}
+
+/// True if the tool mutates terminal state.
+///
+/// Resolved through `McpProvider::find_tool`, an O(1) snapshot lookup. The
+/// obvious alternative — scanning `McpService::get_all_tools()` — returns the
+/// whole catalogue BY VALUE, so a six-call round would copy 926 tool records,
+/// each carrying a serialised JSON schema, six times over, to answer six
+/// booleans.
+///
+/// `find_tool` only knows internal tools, and everything it does not know is
+/// treated as destructive. That is the right default twice over: an
+/// unrecognised name is more likely a stale alias than a proven read, and
+/// external MCP tools are ALREADY gated destructive-by-default in
+/// `McpService::execute_tool` because the MCP wire carries no destructiveness
+/// metadata. Serialising them here matches the security posture they are
+/// executed under. The cost is that a round of external calls does not fan
+/// out; correctness first.
+inline bool tool_is_destructive(const QString& wire_name) {
+    const QString bare = mcp::McpProvider::parse_openai_function_name(wire_name).second;
+    if (bare.isEmpty())
+        return true;
+    const auto t = mcp::McpProvider::instance().find_tool(bare);
+    return t ? t->is_destructive : true;
+}
+
+/// Split a round into execution batches, preserving the model's ordering.
+///
+/// Each batch is a half-open `[begin, end)` range over the round's calls, and
+/// batches run strictly in order. A batch with more than one element is safe to
+/// run concurrently; a destructive call always lands in a batch of its own, so
+/// nothing can overtake it and it can overtake nothing.
+///
+/// Pure and separated from execution because the ordering rule is the part that
+/// can be wrong in a way no build error catches: get it subtly off and a write
+/// silently overtakes a read, in production, occasionally. This shape is
+/// exhaustively checked by the tool self-test.
+inline std::vector<std::pair<std::size_t, std::size_t>> plan_tool_batches(const std::vector<bool>& destructive,
+                                                                         int fanout) {
+    std::vector<std::pair<std::size_t, std::size_t>> batches;
+    const std::size_t n = destructive.size();
+    std::size_t i = 0;
+    while (i < n) {
+        if (fanout <= 1 || destructive[i]) {
+            batches.emplace_back(i, i + 1); // barrier, or fan-out disabled
+            ++i;
+            continue;
+        }
+        std::size_t end = i;
+        while (end < n && static_cast<int>(end - i) < fanout && !destructive[end])
+            ++end;
+        batches.emplace_back(i, end);
+        i = end;
+    }
+    return batches;
+}
+
+/// Execute one round's tool calls, honouring the ordering rules above.
+/// Returns results index-aligned with `calls`.
+inline std::vector<mcp::ToolResult> execute_tool_calls(const std::vector<PendingToolCall>& calls) {
+    std::vector<mcp::ToolResult> out(calls.size());
+    if (calls.empty())
+        return out;
+
+    std::vector<bool> destructive;
+    destructive.reserve(calls.size());
+    for (const auto& c : calls)
+        destructive.push_back(tool_is_destructive(c.wire_name));
+    const auto batches = plan_tool_batches(destructive, tool_fanout());
+
+    // Capture the thread_local context ONCE, on the loop thread, and hand it to
+    // every worker. Reading it inside the worker would read the pool thread's
+    // defaults, which is the bug this exists to prevent.
+    const bool call_in_progress = mcp::TerminalMcpBridge::is_call_in_progress();
+    const bool destructive_allowed = mcp::TerminalMcpBridge::is_destructive_allowed();
+    const QString session_id = t_chat_session_id;
+
+    for (const auto& [begin, end] : batches) {
+        if (end - begin == 1) {
+            // In-thread: a single call gains nothing from a pool hop, and this
+            // keeps the common one-call round byte-for-byte what it was.
+            out[begin] = mcp::McpService::instance().execute_openai_function(calls[begin].wire_name,
+                                                                            calls[begin].args,
+                                                                            /*allow_defer=*/true);
+            continue;
+        }
+        std::vector<QFuture<mcp::ToolResult>> futures;
+        futures.reserve(end - begin);
+        for (std::size_t k = begin; k < end; ++k) {
+            futures.push_back(QtConcurrent::run(
+                [call = calls[k], call_in_progress, destructive_allowed, session_id]() -> mcp::ToolResult {
+                    mcp::TerminalMcpBridge::ScopedCallFlags flags(call_in_progress, destructive_allowed);
+                    ChatSessionGuard session(session_id);
+                    return mcp::McpService::instance().execute_openai_function(call.wire_name, call.args,
+                                                                              /*allow_defer=*/true);
+                }));
+        }
+        for (std::size_t k = begin; k < end; ++k) {
+            auto& f = futures[k - begin];
+            f.waitForFinished();
+            out[k] = f.resultCount() > 0 ? f.result() : mcp::ToolResult::fail("Tool produced no result");
+        }
+    }
+    return out;
 }
 
 } // namespace fincept::ai_chat::detail

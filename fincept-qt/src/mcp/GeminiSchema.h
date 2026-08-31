@@ -48,4 +48,20 @@ std::optional<QJsonObject> sanitize_schema_for_gemini(const QJsonObject& schema)
 /// request when it does.
 bool is_valid_gemini_function_name(const QString& name);
 
+/// Undo the STRING-surrogate substitution `sanitize_schema_for_gemini` applies
+/// to free-form OBJECT parameters, so tool handlers keep receiving real JSON.
+///
+/// Gemini cannot declare "an object with arbitrary keys" — it has no
+/// `additionalProperties`, and an OBJECT with an empty `properties` map is
+/// rejected outright. Such a parameter therefore goes out as a STRING holding
+/// serialised JSON, and the model fills it with a string. Left alone,
+/// `args["params"].toObject()` in the handler yields `{}` — the call silently
+/// does nothing, which is worse than an error.
+///
+/// Walks `original_schema` (the UNSANITISED tool schema) and, wherever it
+/// declares an object or array but the model supplied a string that parses as
+/// one, substitutes the parsed value. Anything that does not parse is left
+/// untouched so the normal argument validator still reports it.
+QJsonObject restore_gemini_call_args(const QJsonObject& original_schema, const QJsonObject& args);
+
 } // namespace fincept::mcp

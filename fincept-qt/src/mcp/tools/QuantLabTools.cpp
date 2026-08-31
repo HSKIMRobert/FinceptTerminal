@@ -178,6 +178,14 @@ constexpr std::size_t kCatalogSize = sizeof(kCatalog) / sizeof(kCatalog[0]);
 void dispatch_quant_async(const QString& module_id, const QString& command, const QJsonObject& params, ToolContext ctx,
                           std::shared_ptr<QPromise<ToolResult>> promise) {
     auto* svc = &services::quant::AIQuantLabService::instance();
+    // Mark the handoff. These tools declare a 300 s budget, so under a job the
+    // model can be polling for minutes; without this the snapshot says only
+    // "running", which cannot distinguish work in flight from a dispatch that
+    // never reached the service. The service reports no finer progress than
+    // result/error, so this is the whole of the honest signal — one tick, not
+    // a fabricated ramp.
+    if (ctx.on_progress)
+        ctx.on_progress(0.0, QStringLiteral("submitted to %1/%2").arg(module_id, command));
     AsyncDispatch::callback_to_promise(svc, std::move(ctx), promise, [svc, module_id, command, params](auto resolve) {
         auto* holder = new QObject(svc);
         QObject::connect(svc, &services::quant::AIQuantLabService::result_ready, holder,

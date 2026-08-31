@@ -36,6 +36,8 @@ QJsonObject JobSnapshot::to_json() const {
     };
     // Omit zero/empty fields — this object is polled repeatedly and every
     // key costs tokens on every poll.
+    if (timeout_ms > 0 && state == JobState::Running)
+        j["timeout_ms"] = timeout_ms; // only useful while there is still a decision to make
     if (progress > 0.0)
         j["progress"] = progress;
     if (!message.isEmpty())
@@ -48,7 +50,7 @@ JobRegistry& JobRegistry::instance() {
     return s;
 }
 
-QString JobRegistry::create(const QString& tool) {
+QString JobRegistry::create(const QString& tool, int timeout_ms) {
     QMutexLocker lock(&mutex_);
     sweep_locked();
 
@@ -61,6 +63,7 @@ QString JobRegistry::create(const QString& tool) {
     job.snap.tool = tool;
     job.snap.state = JobState::Running;
     job.snap.started_ms = now_ms();
+    job.snap.timeout_ms = timeout_ms;
     job.cancel_flag = std::make_shared<std::atomic<bool>>(false);
     jobs_.insert(id, std::move(job));
 

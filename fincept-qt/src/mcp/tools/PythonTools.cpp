@@ -116,6 +116,10 @@ std::vector<ToolDef> get_python_tools() {
 
             auto* runner = &python::PythonRunner::instance();
             AsyncDispatch::callback_to_promise(runner, ctx, promise, [runner, script, script_args, ctx](auto resolve) {
+                // Forward the script's own output as job progress. Under a job
+                // this is the only thing that separates "still working" from
+                // "hung": the tool is one opaque call, so its stdout is the
+                // sole evidence anything is happening.
                 runner->run(script, script_args, [resolve, ctx](python::PythonResult result) {
                     if (ctx.cancelled()) {
                         resolve(ToolResult::fail("cancelled"));
@@ -140,7 +144,7 @@ std::vector<ToolDef> get_python_tools() {
                     } else {
                         resolve(ToolResult::ok(result.output));
                     }
-                });
+                }, AsyncDispatch::line_progress_bridge(ctx));
             });
         };
         tools.push_back(std::move(t));

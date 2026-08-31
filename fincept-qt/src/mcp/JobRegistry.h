@@ -70,6 +70,12 @@ struct JobSnapshot {
     QString message;       // last status line from the handler
     qint64 started_ms = 0; // epoch ms
     qint64 finished_ms = 0;
+    // The handler's hard budget. Reported alongside elapsed_ms because elapsed
+    // alone is undecidable: "running, 40 s" is healthy for a 300 s backtest and
+    // nearly dead for a 45 s quote fetch, and the model has no other way to
+    // tell which it is holding. Together they answer the only question a poll
+    // is really asking — keep waiting, or give up.
+    int timeout_ms = 0;
     bool result_collected = false;
 
     bool is_finished() const { return state != JobState::Running; }
@@ -85,7 +91,9 @@ class JobRegistry {
     static JobRegistry& instance();
 
     /// Register a new running job. Returns its id (e.g. "job_4f21ab").
-    QString create(const QString& tool);
+    /// `timeout_ms` is the handler's hard budget, echoed back by `job_status`
+    /// so a poller can tell a slow job from a stuck one.
+    QString create(const QString& tool, int timeout_ms = 0);
 
     /// Handler progress hook. `progress` is clamped to [0,1]; an empty
     /// `message` leaves the previous one in place.

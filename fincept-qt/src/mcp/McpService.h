@@ -64,6 +64,14 @@ class McpService {
 
     std::size_t tool_count();
 
+    /// The UNSANITISED input schema for a wire function name ("serverId__tool"),
+    /// or an empty object when no such tool is registered.
+    ///
+    /// Needed by the Gemini path: its declarations carry a lossy translation of
+    /// the schema (see mcp/GeminiSchema.h), so the arguments that come back have
+    /// to be reconciled against the original before dispatch.
+    QJsonObject input_schema_for_function(const QString& function_name);
+
     // ── Unified Tool Execution ──────────────────────────────────────────
 
     /// Route to internal or external server.

@@ -28,6 +28,11 @@
     <binary>FinceptTerminal</binary>
   </provides>
   <releases>
+    <release version="4.5.0" date="2026-08-31">
+      <description>
+        <p>Version 4.5.0 — Fixes AI tool calling with Google Gemini: around 150 tools that take a free-form options object were being advertised to Gemini as taking no arguments, so they could be called but never given any input. The assistant now runs a turn's independent tool calls in parallel, while tools that change something still run in order. Long-running work (backtests, quant modules, agent runs) hands back a job you can watch and cancel instead of freezing the conversation, now across ~190 tools rather than a dozen. Tool sequences gain a time limit alongside the step limit and report which ran out. Fixes the AstraFlow providers failing to resolve their endpoint when the base URL was cleared.</p>
+      </description>
+    </release>
     <release version="4.4.1" date="2026-08-19">
       <description>
         <p>Version 4.4.1 — Adds the TickerAll (MetaTrader 5) broker integration for linking and trading MT5 accounts. Python runtime provisioning is more reliable on first run, and the unused FinRL analytics module and its heavy dependencies have been removed.</p>

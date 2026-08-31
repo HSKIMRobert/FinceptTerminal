@@ -906,23 +906,44 @@ void ProfileScreen::show_delete_account_dialog() {
     if (first != QMessageBox::Yes)
         return;
 
-    // Second confirmation — type email + enter password to confirm
+    // Second confirmation — type email + enter password to confirm.
+    //
+    // The password gate used to be unsatisfiable for anyone who signed up via
+    // Google: those accounts have no password, the DELETE button stayed
+    // permanently disabled, and the dialog offered no way to set one. The
+    // reset flow already existed (ForgotPasswordScreen) but was reachable only
+    // from Login and Help — both pre-login surfaces — so a signed-in user
+    // could not get to it at all. Hence "no input screen or text field is
+    // displayed to enter the code" (issue #378).
+    //
+    // The fix does not try to detect an OAuth account: it can't. Neither
+    // UserProfile nor the session carries an auth-provider or has-password
+    // field, so the client has no way to know. Instead the set/reset path is
+    // put inline here and offered to everyone — which serves the passwordless
+    // Google user and the ordinary "I forgot it" user with one control, and
+    // needs no new backend field. /user/forgot-password and
+    // /user/reset-password are public, email-keyed endpoints, so they work
+    // just as well while signed in.
     auto* dlg = new QDialog(this);
     dlg->setWindowTitle(tr("Confirm Account Deletion"));
-    dlg->setFixedSize(400, 260);
+    dlg->setMinimumWidth(420);
     dlg->setStyleSheet(QString("background:%1;color:%2;font-family:'Consolas',monospace;")
                            .arg(ui::colors::BG_SURFACE(), ui::colors::TEXT_PRIMARY()));
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(20, 16, 20, 16);
     vl->setSpacing(10);
 
+    const QString danger_lbl_ss =
+        QString("color:%1;font-size:11px;font-weight:700;background:transparent;").arg(ui::colors::NEGATIVE());
+    const QString muted_lbl_ss =
+        QString("color:%1;font-size:11px;background:transparent;").arg(ui::colors::TEXT_SECONDARY());
+
     auto* warn = new QLabel(tr("TYPE YOUR EMAIL ADDRESS TO CONFIRM:"));
-    warn->setStyleSheet(
-        QString("color:%1;font-size:11px;font-weight:700;background:transparent;").arg(ui::colors::NEGATIVE()));
+    warn->setStyleSheet(danger_lbl_ss);
     vl->addWidget(warn);
 
     auto* hint = new QLabel(email);
-    hint->setStyleSheet(QString("color:%1;font-size:11px;background:transparent;").arg(ui::colors::TEXT_SECONDARY()));
+    hint->setStyleSheet(muted_lbl_ss);
     vl->addWidget(hint);
 
     auto* input = new QLineEdit;
@@ -931,8 +952,7 @@ void ProfileScreen::show_delete_account_dialog() {
     vl->addWidget(input);
 
     auto* pw_lbl = new QLabel(tr("ENTER YOUR PASSWORD:"));
-    pw_lbl->setStyleSheet(
-        QString("color:%1;font-size:11px;font-weight:700;background:transparent;").arg(ui::colors::NEGATIVE()));
+    pw_lbl->setStyleSheet(danger_lbl_ss);
     vl->addWidget(pw_lbl);
 
     auto* pw_input = new QLineEdit;
@@ -940,6 +960,79 @@ void ProfileScreen::show_delete_account_dialog() {
     pw_input->setEchoMode(QLineEdit::Password);
     pw_input->setPlaceholderText(tr("Current password"));
     vl->addWidget(pw_input);
+
+    // ── Entry point into the inline set/reset flow ───────────────────────────
+    auto* reset_link = new QPushButton(tr("Signed in with Google, or forgot your password? Email me a code"));
+    reset_link->setFlat(true);
+    reset_link->setCursor(Qt::PointingHandCursor);
+    reset_link->setStyleSheet(QString("QPushButton{background:transparent;border:none;color:%1;font-size:11px;"
+                                      "text-align:left;padding:0;font-family:'Consolas',monospace;}"
+                                      "QPushButton:hover{color:%2;text-decoration:underline;}")
+                                  .arg(ui::colors::INFO(), ui::colors::AMBER()));
+    vl->addWidget(reset_link);
+
+    // ── Reset panel: hidden until the link above is used ─────────────────────
+    auto* reset_box = new QWidget;
+    reset_box->setStyleSheet("background:transparent;");
+    reset_box->setVisible(false);
+    auto* rl = new QVBoxLayout(reset_box);
+    rl->setContentsMargins(0, 4, 0, 0);
+    rl->setSpacing(8);
+
+    auto* sep = new QFrame;
+    sep->setFrameShape(QFrame::HLine);
+    sep->setStyleSheet(QString("background:%1;border:none;max-height:1px;").arg(ui::colors::BORDER_DIM()));
+    rl->addWidget(sep);
+
+    auto* code_lbl = new QLabel(tr("6-DIGIT CODE FROM YOUR EMAIL:"));
+    code_lbl->setStyleSheet(danger_lbl_ss);
+    rl->addWidget(code_lbl);
+
+    auto* code_input = new QLineEdit;
+    code_input->setFixedHeight(28);
+    code_input->setPlaceholderText(tr("Verification code"));
+    rl->addWidget(code_input);
+
+    auto* new_pw_lbl = new QLabel(tr("NEW PASSWORD (MIN 8 CHARACTERS):"));
+    new_pw_lbl->setStyleSheet(danger_lbl_ss);
+    rl->addWidget(new_pw_lbl);
+
+    auto* new_pw = new QLineEdit;
+    new_pw->setFixedHeight(28);
+    new_pw->setEchoMode(QLineEdit::Password);
+    new_pw->setPlaceholderText(tr("New password"));
+    rl->addWidget(new_pw);
+
+    auto* confirm_pw = new QLineEdit;
+    confirm_pw->setFixedHeight(28);
+    confirm_pw->setEchoMode(QLineEdit::Password);
+    confirm_pw->setPlaceholderText(tr("Confirm new password"));
+    rl->addWidget(confirm_pw);
+
+    auto* set_pw_btn = new QPushButton(tr("SET PASSWORD"));
+    set_pw_btn->setFixedHeight(26);
+    set_pw_btn->setStyleSheet(QString("QPushButton{background:%1;color:%2;border:none;padding:0 14px;"
+                                      "font-size:11px;font-weight:700;font-family:'Consolas',monospace;}"
+                                      "QPushButton:hover{background:#b45309;}")
+                                  .arg(ui::colors::AMBER(), ui::colors::BG_BASE()));
+    rl->addWidget(set_pw_btn);
+    vl->addWidget(reset_box);
+
+    // Shared status line for both the code request and the reset itself.
+    auto* status = new QLabel;
+    status->setWordWrap(true);
+    status->setStyleSheet(muted_lbl_ss);
+    status->hide();
+    vl->addWidget(status);
+
+    auto say = [status, dlg](const QString& msg, const QString& color) {
+        status->setStyleSheet(QString("color:%1;font-size:11px;background:transparent;").arg(color));
+        status->setText(msg);
+        status->show();
+        // The dialog grows as the reset panel and status line appear; without
+        // this it keeps its original height and clips them.
+        dlg->adjustSize();
+    };
 
     auto* brl = new QHBoxLayout;
     brl->addStretch();
@@ -963,6 +1056,76 @@ void ProfileScreen::show_delete_account_dialog() {
     connect(input, &QLineEdit::textChanged, this, [reeval](const QString&) { reeval(); });
     connect(pw_input, &QLineEdit::textChanged, this, [reeval](const QString&) { reeval(); });
 
+    // Deliberately NOT captured as a local reference: the lambdas below
+    // outlive this stack frame (they are owned by dlg, and a queued HTTP reply
+    // can land after exec() returns but before deleteLater() runs), so they
+    // call the singleton accessor themselves rather than hold a reference to
+    // a local that has gone away.
+    auto* auth_mgr = &auth::AuthManager::instance();
+
+    // Reveal the panel and ask for a code in one click — the reporter's flow
+    // was "click reset, then look for somewhere to type the code", so the
+    // field has to be on screen by the time the email lands.
+    connect(reset_link, &QPushButton::clicked, dlg, [reset_box, reset_link, code_input, say, email]() {
+        reset_box->setVisible(true);
+        reset_link->setText(tr("Re-send code"));
+        code_input->setFocus();
+        say(tr("Sending a verification code to %1 ...").arg(email), ui::colors::TEXT_SECONDARY());
+        auth::AuthManager::instance().forgot_password(email);
+    });
+
+    // AuthManager's signals are global to the singleton; scoping every
+    // connection to `dlg` means they die with the dialog rather than firing
+    // into a destroyed lambda later.
+    connect(auth_mgr, &auth::AuthManager::forgot_password_sent, dlg, [say, email]() {
+        say(tr("Code sent to %1. Enter it above with a new password.").arg(email), ui::colors::POSITIVE());
+    });
+    connect(auth_mgr, &auth::AuthManager::forgot_password_failed, dlg,
+            [say](const QString& err) { say(tr("Could not send code: %1").arg(err), ui::colors::NEGATIVE()); });
+
+    connect(set_pw_btn, &QPushButton::clicked, dlg,
+            [set_pw_btn, code_input, new_pw, confirm_pw, say, email]() {
+                // Same rules as ForgotPasswordScreen::on_reset_password, so the
+                // two paths can't disagree about what a valid password is.
+                const QString otp = code_input->text().trimmed();
+                if (otp.isEmpty()) {
+                    say(tr("Enter the verification code from your email"), ui::colors::NEGATIVE());
+                    code_input->setFocus();
+                    return;
+                }
+                if (new_pw->text().length() < 8) {
+                    say(tr("Password must be at least 8 characters"), ui::colors::NEGATIVE());
+                    new_pw->setFocus();
+                    return;
+                }
+                if (new_pw->text() != confirm_pw->text()) {
+                    confirm_pw->clear();
+                    say(tr("Passwords do not match"), ui::colors::NEGATIVE());
+                    confirm_pw->setFocus();
+                    return;
+                }
+                set_pw_btn->setEnabled(false);
+                say(tr("Setting password ..."), ui::colors::TEXT_SECONDARY());
+                auth::AuthManager::instance().reset_password(email, otp, new_pw->text());
+            });
+
+    connect(auth_mgr, &auth::AuthManager::password_reset_succeeded, dlg,
+            [reset_box, reset_link, set_pw_btn, pw_input, new_pw, say, reeval]() {
+                // Carry the new password straight into the delete field: the
+                // user just typed it twice, and asking a third time to satisfy
+                // a gate they only opened in order to delete is pure friction.
+                pw_input->setText(new_pw->text());
+                reset_box->setVisible(false);
+                reset_link->hide();
+                set_pw_btn->setEnabled(true);
+                say(tr("Password set. You can now delete your account."), ui::colors::POSITIVE());
+                reeval();
+            });
+    connect(auth_mgr, &auth::AuthManager::password_reset_failed, dlg, [set_pw_btn, say](const QString& err) {
+        set_pw_btn->setEnabled(true);
+        say(tr("Could not set password: %1").arg(err), ui::colors::NEGATIVE());
+    });
+
     QPointer<ProfileScreen> self = this;
     QPointer<QDialog> dlg_ptr = dlg;
     connect(confirm, &QPushButton::clicked, this, [self, dlg_ptr, email, pw_input]() {
@@ -977,12 +1140,21 @@ void ProfileScreen::show_delete_account_dialog() {
             if (r.success) {
                 LOG_INFO("Profile", "Account deleted successfully");
                 auth::AuthManager::instance().logout();
-            } else {
-                LOG_ERROR("Profile", "Account deletion failed: " + r.error);
-                QMessageBox::critical(
-                    self, tr("Delete Failed"),
-                    tr("Account deletion failed: %1\n\nPlease contact support@fincept.in").arg(r.error));
+                return;
             }
+            // Never log r.error's context alongside the password; the error
+            // string itself is server wording and safe.
+            LOG_ERROR("Profile", "Account deletion failed: " + r.error);
+            QString detail = r.error;
+            if (r.status_code == 401) {
+                // Resetting the password can invalidate the session that was
+                // issued before it, so a 401 here is more likely "your session
+                // is stale" than "wrong password" — say so rather than sending
+                // the user round the password loop again.
+                detail = tr("%1\n\nIf you just set a new password, sign out and back in, then retry.").arg(r.error);
+            }
+            QMessageBox::critical(self, tr("Delete Failed"),
+                                  tr("Account deletion failed: %1\n\nPlease contact support@fincept.in").arg(detail));
         });
     });
     brl->addWidget(confirm);

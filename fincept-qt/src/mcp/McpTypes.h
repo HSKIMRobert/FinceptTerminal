@@ -10,6 +10,7 @@
 #include <QString>
 #include <QStringList>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -27,6 +28,12 @@ constexpr int kMcpDefaultTimeoutMs = 30000;
 /// answer in one round-trip while a real long-runner backgrounds promptly.
 /// Overridable via the `mcp/job_grace_ms` setting.
 constexpr int kMcpJobGraceMs = 2500;
+
+/// A tool whose declared `default_timeout_ms` exceeds this is treated as
+/// job-eligible without setting `ToolDef::supports_async` (see the note there).
+/// Equal to the default timeout on purpose: a tool that kept the default has
+/// said nothing about being slow, while one that raised it has.
+constexpr int kMcpAsyncJobThresholdMs = kMcpDefaultTimeoutMs;
 
 // ============================================================================
 // Tool Result — returned by tool handlers
@@ -117,6 +124,24 @@ struct ToolContext {
     /// finished by then. Default: 30s; per-tool override via
     /// ToolDef::default_timeout_ms; per-call override via _meta.timeout_ms.
     int timeout_ms = kMcpDefaultTimeoutMs;
+
+    /// The single-winner guard for resolving this call's promise. Set by
+    /// `McpProvider::call_tool_async`; may be null for a hand-built context.
+    ///
+    /// A promise must be finished exactly once, and THREE things can want to
+    /// finish this one: the handler, the timeout watchdog, and the cancellation
+    /// watch. They run on different threads, so "is it finished yet?" is not a
+    /// usable test — two of them can read "no" and both call addResult(), with
+    /// the loser writing after finish(), which Qt asserts on.
+    ///
+    /// The provider and `AsyncDispatch` each used to make their own guard over
+    /// the same promise, which is not a guard at all: two independent
+    /// compare-exchanges each let exactly one of THEIR OWN contenders through,
+    /// so the watchdog and a late service callback could still both win. That
+    /// race needs a slow tool and a timeout landing together to show up, which
+    /// is precisely the workload the job protocol exists for. Sharing one flag
+    /// through the context makes all three contenders race the same atomic.
+    std::shared_ptr<std::atomic<bool>> resolve_guard;
 
     /// Convenience — true if cancellation hook is set AND signalled.
     bool cancelled() const { return is_cancelled && is_cancelled(); }
@@ -314,6 +339,19 @@ struct ToolDef {
     ///
     /// Requires `async_handler` — a sync handler cannot be interrupted or
     /// backgrounded, so the flag is ignored for those.
+    ///
+    /// USUALLY YOU DO NOT NEED TO SET THIS. Eligibility is *derived* from
+    /// `default_timeout_ms` (see `kMcpAsyncJobThresholdMs`): a tool that
+    /// declares a budget longer than the default 30 s has already said its p95
+    /// is tens of seconds, so it opts in automatically. The flag was
+    /// hand-maintained for a while and reached 12 of the ~125 tools that
+    /// qualified — the other ~113, including 97 AI Quant Lab tools carrying a
+    /// 300 s budget, blocked the provider's HTTP turn for their full timeout
+    /// with no receipt and no progress. Deriving it removes the second place
+    /// the same fact had to be written down.
+    ///
+    /// Set it explicitly only for a tool that is slow in practice but declares
+    /// a short nominal timeout — it is an override, never a requirement.
     bool supports_async = false;
 
     // ── Phase 6: Authorization ──────────────────────────────────────────

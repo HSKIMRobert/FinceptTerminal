@@ -41,9 +41,17 @@ LlmResponse LlmService::do_tool_loop(QJsonArray loop_messages, const QString& ur
     // → actual call), so the default 40 gives ~13 real actions — enough for a
     // full report template fill. Below ~12 silently cripples report-builder flows.
     const int MAX_ROUNDS = active_max_tool_rounds();
-    LOG_INFO(kLlmToolLoopTag, QString("TOOL LOOP: starting (max %1 rounds, model=%2)").arg(MAX_ROUNDS).arg(model_));
+    // Rounds bound the token spend; the deadline bounds the wait. A round that
+    // long-polls a background job can take 30 s, so MAX_ROUNDS alone leaves the
+    // turn unbounded in wall-clock terms.
+    detail::ToolLoopBudget budget(MAX_ROUNDS);
+    LOG_INFO(kLlmToolLoopTag, QString("TOOL LOOP: starting (max %1 rounds, %2 s deadline, model=%3)")
+                                  .arg(MAX_ROUNDS)
+                                  .arg(detail::tool_loop_deadline_ms() / 1000)
+                                  .arg(model_));
 
-    for (int round = 0; round < MAX_ROUNDS; ++round) {
+    for (int round = 0; !budget.exhausted(); ++round) {
+        budget.note_round();
         QJsonObject fu;
         fu["model"] = model_;
         fu["messages"] = loop_messages;
@@ -80,39 +88,57 @@ LlmResponse LlmService::do_tool_loop(QJsonArray loop_messages, const QString& ur
         if (!tcs.isEmpty()) {
             // Another round
             loop_messages.append(msg);
+            // Collect the whole round before executing any of it: the calls in
+            // one assistant turn are independent by construction, so they are
+            // dispatched together (read-only ones concurrently, writes as
+            // barriers — see detail::execute_tool_calls).
+            std::vector<detail::PendingToolCall> calls;
+            calls.reserve(static_cast<std::size_t>(tcs.size()));
             for (const auto& tc_val : tcs) {
-                QJsonObject tc = tc_val.toObject();
-                QString cid = tc["id"].toString();
-                QString fname = tc["function"].toObject()["name"].toString();
-                QJsonObject fa =
+                const QJsonObject tc = tc_val.toObject();
+                detail::PendingToolCall c;
+                c.call_id = tc["id"].toString();
+                c.wire_name = tc["function"].toObject()["name"].toString();
+                c.args =
                     QJsonDocument::fromJson(tc["function"].toObject()["arguments"].toString("{}").toUtf8()).object();
-
-                LOG_INFO(
-                    kLlmToolLoopTag,
-                    QString("TOOL LOOP r%1: executing %2 args=%3")
-                        .arg(round)
-                        .arg(fname, QString::fromUtf8(QJsonDocument(fa).toJson(QJsonDocument::Compact)).left(200)));
                 // Strip "<server>__" prefix for user-visible label; decode any wire encoding.
-                QString display = fname;
-                int sep = display.indexOf(QStringLiteral("__"));
+                c.display = c.wire_name;
+                const int sep = c.display.indexOf(QStringLiteral("__"));
                 if (sep > 0)
-                    display = display.mid(sep + 2);
-                display.replace(QStringLiteral("-dot-"), QStringLiteral("."));
-                detail::emit_tool_progress(display, fa);
-                // allow_defer: this is the one call site that knows about the
-                // job_* tools, so it is the one allowed to receive a receipt
-                // instead of a result for a long-running tool.
-                auto tr = mcp::McpService::instance().execute_openai_function(fname, fa, /*allow_defer=*/true);
+                    c.display = c.display.mid(sep + 2);
+                c.display.replace(QStringLiteral("-dot-"), QStringLiteral("."));
+
+                LOG_INFO(kLlmToolLoopTag,
+                         QString("TOOL LOOP r%1: executing %2 args=%3")
+                             .arg(round)
+                             .arg(c.wire_name,
+                                  QString::fromUtf8(QJsonDocument(c.args).toJson(QJsonDocument::Compact)).left(200)));
+                // Progress lines are emitted here, on the loop thread, in the
+                // model's order — not from the workers, whose completion order
+                // is arbitrary and whose thread has no business touching the UI.
+                detail::emit_tool_progress(c.display, c.args);
+                calls.push_back(std::move(c));
+            }
+
+            // allow_defer is set inside execute_tool_calls: this is the one call
+            // site that knows about the job_* tools, so it is the one allowed to
+            // receive a receipt instead of a result for a long-running tool.
+            const auto results = detail::execute_tool_calls(calls);
+            for (std::size_t k = 0; k < calls.size(); ++k) {
+                const auto& c = calls[k];
+                const auto& tr = results[k];
                 LOG_INFO(kLlmToolLoopTag,
                          QString("TOOL LOOP r%1: %2 -> %3 (msg=%4 err=%5)")
                              .arg(round)
-                             .arg(fname, tr.success ? "OK" : "FAIL", tr.message.left(120), tr.error.left(120)));
+                             .arg(c.wire_name, tr.success ? "OK" : "FAIL", tr.message.left(120), tr.error.left(120)));
                 // If this was a discovery call (tool_list / tool_describe), declare
                 // what it surfaced so the model can actually call it next round.
-                detail::note_tool_activations(display, fa, tr, activated);
+                // Applied in the model's order so the activation LRU evicts the
+                // same way it did when execution was sequential.
+                detail::note_tool_activations(c.display, c.args, tr, activated);
                 loop_messages.append(QJsonObject{{"role", "tool"},
-                                                 {"tool_call_id", cid},
-                                                 {"content", detail::encode_tool_result_for_llm(display, tr)}});
+                                                 {"tool_call_id", c.call_id},
+                                                 {"content", detail::encode_tool_result_for_llm(c.display, tr)}});
             }
             continue;
         }
@@ -151,14 +177,19 @@ LlmResponse LlmService::do_tool_loop(QJsonArray loop_messages, const QString& ur
         return resp;
     }
 
-    // Max rounds exhausted. Force one final turn so the chat doesn't go silent.
-    LOG_WARN(kLlmToolLoopTag, "TOOL LOOP: exceeded max rounds — forcing summary turn");
+    // Budget exhausted. Force one final turn so the chat doesn't go silent, and
+    // tell the model WHICH budget ran out — "you are out of rounds" and "you are
+    // out of time" call for different summaries, and a model told only "budget"
+    // tends to relitigate the plan instead of reporting what it has.
+    const QString exhaustion = budget.exhaustion_note();
+    LOG_WARN(kLlmToolLoopTag, "TOOL LOOP: " + exhaustion + " — forcing summary turn");
     {
-        loop_messages.append(
-            QJsonObject{{"role", "system"},
-                        {"content", "You have used your tool-call budget. Reply now with a final summary of what "
-                                    "you accomplished and what (if anything) is incomplete. If there are critical "
-                                    "remaining tool calls, you may make them, but prefer summarising."}});
+        loop_messages.append(QJsonObject{
+            {"role", "system"},
+            {"content", "You have used your tool budget (" + exhaustion +
+                            "). Reply now with a final summary of what you accomplished and what (if anything) is "
+                            "incomplete. If there are critical remaining tool calls, you may make them, but prefer "
+                            "summarising."}});
 
         QJsonObject fu;
         fu["model"] = model_;

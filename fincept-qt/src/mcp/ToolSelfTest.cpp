@@ -2,11 +2,15 @@
 
 #include "mcp/ToolSelfTest.h"
 
+#include "mcp/JobRegistry.h"
+#include "services/llm/LlmRequestPolicy.h"
+
 #include "mcp/McpProvider.h"
 #include "mcp/ToolRetriever.h"
 
 #include <QHash>
 #include <QJsonArray>
+#include <QElapsedTimer>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
@@ -15,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 namespace fincept::mcp {
@@ -210,7 +215,9 @@ int run_tool_selftest() {
     QStringList bad_schema;              // CRITICAL — required param not declared
     QStringList thin_desc;               // WARN — retrieval-poison
     QStringList destructive_miss;        // WARN — mutating verb but not flagged destructive
+    QStringList blocking_slow;           // CRITICAL — slow tool that can't be backgrounded
     QHash<QString, QStringList> by_desc; // duplicate-description detection
+    int job_eligible_count = 0;
 
     static const QRegularExpression mutating_rx(
         QStringLiteral("(?:^|_)(delete|remove|cancel|close|clear|wipe|drop|reset|unregister)(?:_|$)"),
@@ -243,6 +250,27 @@ int run_tool_selftest() {
         if (mutating_rx.match(t.name).hasMatch() && !t.is_destructive)
             destructive_miss << t.name;
 
+        // §M1: a tool whose declared budget exceeds the 30 s default has said
+        // its p95 is tens of seconds, so it MUST be backgroundable — otherwise
+        // an LLM call to it holds the provider's HTTP turn open for the full
+        // budget with no receipt to poll and no way to cancel. The only way to
+        // fail this is a sync-only handler, which cannot be observed or
+        // interrupted: the fix is to give the tool an async handler, not to
+        // lower its timeout.
+        if (t.job_eligible) {
+            ++job_eligible_count;
+        } else if (t.default_timeout_ms > kMcpAsyncJobThresholdMs && t.has_handler &&
+                   !t.name.startsWith(QLatin1String("job_"))) {
+            // The `job_*` meta-tools are the one principled exception, and the
+            // reason is worth stating: `job_status` carries a 35 s budget purely
+            // because it LONG-POLLS another job. Backgrounding it would mean
+            // starting a job to watch a job, and the model would then have to
+            // poll the poll. Their budget is a waiting period, not work.
+            blocking_slow << QStringLiteral("%1 (%2 ms budget, sync-only handler)")
+                                 .arg(t.name)
+                                 .arg(t.default_timeout_ms);
+        }
+
         const QString key = t.description.trimmed().toLower();
         if (!key.isEmpty())
             by_desc[key] << t.name;
@@ -263,6 +291,8 @@ int run_tool_selftest() {
     report_list(QStringLiteral("tools with invalid schema"), bad_schema, true);
     report_list(QStringLiteral("tools with thin description (<20 chars)"), thin_desc, false);
     report_list(QStringLiteral("mutating tools NOT flagged destructive"), destructive_miss, false);
+    report_list(QStringLiteral("slow tools that CANNOT be backgrounded"), blocking_slow, true);
+    out(QStringLiteral("    ✓ tools eligible for the async job protocol: ") + QString::number(job_eligible_count));
 
     QStringList dup_desc;
     for (auto it = by_desc.cbegin(); it != by_desc.cend(); ++it) {
@@ -317,6 +347,139 @@ int run_tool_selftest() {
         out(QStringLiteral("\n    WEAK (found but not rank-1):"));
         for (const auto& w : weak)
             out(w);
+    }
+
+    // — Part 3: async job lifecycle ———
+    //
+    // The registry is what makes a long-running tool observable and
+    // interruptible, and until now nothing exercised it. Every assertion here
+    // is a property the model depends on when it is holding a receipt: that a
+    // long-poll actually blocks, that progress survives, that a cancelled job
+    // reaches a terminal state, and that a result can be collected exactly once.
+    {
+        out(QStringLiteral("\n[3] ASYNC JOB LIFECYCLE"));
+        QStringList errs;
+        auto& jobs = JobRegistry::instance();
+
+        const QString id = jobs.create(QStringLiteral("__selftest_tool"), 90000);
+        auto snap = jobs.status(id);
+        if (!snap)
+            errs << QStringLiteral("a job disappeared immediately after create()");
+        else {
+            if (snap->state != JobState::Running)
+                errs << QStringLiteral("a new job is not in the Running state");
+            // The budget must reach the wire: elapsed without it is undecidable.
+            const QJsonObject wire = snap->to_json();
+            if (wire.value(QStringLiteral("timeout_ms")).toInt() != 90000)
+                errs << QStringLiteral("job_status omits timeout_ms, leaving elapsed_ms uninterpretable");
+            if (!wire.contains(QStringLiteral("elapsed_ms")))
+                errs << QStringLiteral("job_status omits elapsed_ms");
+            if (wire.contains(QStringLiteral("progress")))
+                errs << QStringLiteral("a job with no reported progress must omit the field, not report 0");
+        }
+
+        jobs.set_progress(id, 0.42, QStringLiteral("halfway"));
+        snap = jobs.status(id);
+        if (!snap || snap->progress < 0.41 || snap->progress > 0.43)
+            errs << QStringLiteral("reported progress did not reach the snapshot");
+        if (snap && snap->message != QLatin1String("halfway"))
+            errs << QStringLiteral("reported status message did not reach the snapshot");
+
+        // A zero-wait poll must not block; a real wait must actually elapse
+        // rather than returning instantly (that is what keeps a poll from
+        // costing one tool round per second).
+        QElapsedTimer t;
+        t.start();
+        jobs.wait_for(id, 0);
+        if (t.elapsed() > 50)
+            errs << QStringLiteral("wait_for(0) blocked; it must return immediately");
+        t.restart();
+        jobs.wait_for(id, 300);
+        const qint64 waited = t.elapsed();
+        if (waited < 250)
+            errs << QStringLiteral("wait_for(300) returned after %1 ms without the job finishing").arg(waited);
+
+        // Cancellation raises the flag but must NOT fake a terminal state: the
+        // job stays Running until the work actually unwinds, otherwise the model
+        // collects a result that was never produced.
+        if (!jobs.request_cancel(id))
+            errs << QStringLiteral("request_cancel refused a running job");
+        if (!jobs.is_cancelled(id))
+            errs << QStringLiteral("the cancellation flag did not latch");
+        snap = jobs.status(id);
+        if (snap && snap->state != JobState::Running)
+            errs << QStringLiteral("cancel moved the job to a terminal state before the handler unwound");
+
+        jobs.complete(id, ToolResult::ok(QStringLiteral("finished")));
+        snap = jobs.status(id);
+        if (!snap || !snap->is_finished())
+            errs << QStringLiteral("complete() left the job running");
+        if (auto r = jobs.take_result(id)) {
+            if (r->message != QLatin1String("finished"))
+                errs << QStringLiteral("take_result returned a different payload than was stored");
+        } else {
+            errs << QStringLiteral("take_result found nothing after complete()");
+        }
+        // Completing twice is the watchdog/handler race; the second must lose.
+        jobs.complete(id, ToolResult::fail(QStringLiteral("late loser")));
+        if (auto r2 = jobs.take_result(id); r2 && r2->message != QLatin1String("finished"))
+            errs << QStringLiteral("a second complete() overwrote the winning result");
+
+        if (jobs.status(QStringLiteral("job_does_not_exist")).has_value())
+            errs << QStringLiteral("an unknown job id returned a status");
+
+        report_list(QStringLiteral("job lifecycle failures"), errs, true);
+    }
+
+    // — Part 4: tool-call batch planning ———
+    //
+    // Ordering is the one property of parallel execution that no compiler and
+    // no smoke test will catch: get it wrong and a write silently overtakes a
+    // read, occasionally, in production. The rule is that a destructive call is
+    // a barrier, so these cases pin the shape exactly.
+    {
+        out(QStringLiteral("\n[4] TOOL-CALL BATCH PLANNING"));
+        QStringList errs;
+        using Batches = std::vector<std::pair<std::size_t, std::size_t>>;
+
+        auto describe = [](const Batches& b) {
+            QStringList parts;
+            for (const auto& [x, y] : b)
+                parts << QStringLiteral("[%1,%2)").arg(x).arg(y);
+            return parts.join(QLatin1Char(' '));
+        };
+        auto check = [&](const QString& label, const std::vector<bool>& destructive, int fanout,
+                         const Batches& want) {
+            const Batches got = ai_chat::detail::plan_tool_batches(destructive, fanout);
+            if (got != want) {
+                errs << QStringLiteral("%1: got %2, expected %3").arg(label, describe(got), describe(want));
+                return;
+            }
+            // Whatever the plan, it must cover every call exactly once and in
+            // order — that is what keeps results index-aligned.
+            std::size_t cursor = 0;
+            for (const auto& [x, y] : got) {
+                if (x != cursor || y <= x)
+                    errs << QStringLiteral("%1: batches are not a contiguous ordered cover").arg(label);
+                cursor = y;
+            }
+            if (cursor != destructive.size())
+                errs << QStringLiteral("%1: batches do not cover every call").arg(label);
+        };
+
+        check(QStringLiteral("all read-only fan out together"), {false, false, false}, 4, {{0, 3}});
+        check(QStringLiteral("fanout caps the batch"), {false, false, false, false, false}, 2,
+              {{0, 2}, {2, 4}, {4, 5}});
+        check(QStringLiteral("fanout=1 is fully sequential"), {false, false, false}, 1, {{0, 1}, {1, 2}, {2, 3}});
+        check(QStringLiteral("a destructive call runs alone"), {true}, 4, {{0, 1}});
+        // The case that matters: a write must not be overtaken by the read after
+        // it, nor overtake the read before it.
+        check(QStringLiteral("a write is a barrier"), {false, false, true, false, false}, 4,
+              {{0, 2}, {2, 3}, {3, 5}});
+        check(QStringLiteral("consecutive writes stay serial"), {true, true}, 4, {{0, 1}, {1, 2}});
+        check(QStringLiteral("empty round plans nothing"), {}, 4, {});
+
+        report_list(QStringLiteral("batch planning failures"), errs, true);
     }
 
     out(QStringLiteral("\n──────────────────────────────────────────────────────────────"));

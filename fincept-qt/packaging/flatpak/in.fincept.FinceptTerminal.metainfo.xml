@@ -71,6 +71,14 @@
   </provides>
 
   <releases>
+    <release version="4.5.0" date="2026-08-31">
+      <description>
+        <p>Fixes AI tool calling with Google Gemini. Around 150 tools take a free-form options object, which Gemini's schema cannot express; those tools were being advertised to Gemini as taking no arguments at all, so the assistant could call them but never pass them anything. They now work on Gemini as they already did on other providers.</p>
+        <p>The assistant runs a turn's independent tool calls at the same time instead of one after another, so a request that needs several lookups returns sooner. Tools that change something still run in order, on their own.</p>
+        <p>Long-running work — backtests, quant modules, agent runs — hands back a job you can watch instead of freezing the conversation for minutes; this now covers around 190 tools rather than a dozen. Job status reports elapsed time against the tool's own budget along with the tool's latest output, and cancelling a job returns control immediately.</p>
+        <p>Tool sequences now have a time limit as well as a step limit, and say which one ran out instead of stopping without explanation. Also fixes the AstraFlow and AstraFlow CN providers failing to find their endpoint when the base URL field was cleared.</p>
+      </description>
+    </release>
     <release version="4.4.1" date="2026-08-19">
       <description>
         <p>Adds the TickerAll (MetaTrader 5) broker integration, so MT5 accounts can be linked, funded and traded from the equity trading screen alongside the existing brokers.</p>

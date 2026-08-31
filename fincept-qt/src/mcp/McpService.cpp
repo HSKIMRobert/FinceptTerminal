@@ -543,6 +543,18 @@ std::size_t McpService::tool_count() {
     return get_all_tools().size();
 }
 
+QJsonObject McpService::input_schema_for_function(const QString& function_name) {
+    auto [server_id, tool_name] = McpProvider::parse_openai_function_name(function_name);
+    if (server_id.isEmpty() || tool_name.isEmpty())
+        return {};
+    QMutexLocker lock(&mutex_);
+    for (const auto& t : cached_tools_locked()) {
+        if (t.server_id == server_id && t.name == tool_name)
+            return t.input_schema;
+    }
+    return {};
+}
+
 // ============================================================================
 // Tool Execution
 // ============================================================================

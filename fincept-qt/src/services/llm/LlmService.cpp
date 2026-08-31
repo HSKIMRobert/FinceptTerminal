@@ -7,10 +7,13 @@
 #include "core/logging/Logger.h"
 #include "datahub/DataHub.h"
 #include "datahub/TopicPolicy.h"
+#include "mcp/GeminiSchema.h"
 #include "mcp/McpProvider.h"
 #include "mcp/McpService.h"
 #include "services/llm/LlmContentExtractors.h"
 #include "services/llm/LlmRequestPolicy.h"
+
+#include <vector>
 #include "services/llm/ModelCatalog.h"
 #include "services/llm/ProviderCatalog.h"
 #include "storage/repositories/LlmConfigRepository.h"
@@ -342,70 +345,23 @@ QString LlmService::get_endpoint_url() const {
         return {};
 
     // Fincept sync chat endpoint (async lives in fincept_async_request).
-    if (p == "fincept") {
+    // The only provider whose route is not derivable from a base_url, so it is
+    // the only one ProviderCatalog::chat_endpoint leaves to the caller.
+    if (p == "fincept")
         return fincept::AppConfig::instance().api_base_url() + "/research/chat";
-    }
 
-    // Custom base_url wins over hard-coded defaults.
-    if (!base_url_.isEmpty()) {
-        QString base = base_url_;
-        while (base.endsWith('/'))
-            base.chop(1);
-
-        // Gemini is the one provider whose request body is NOT OpenAI-shaped,
-        // so a custom base_url has to compose Gemini's own path. Appending
-        // "/chat/completions" (what every other provider gets) pointed a
-        // native `contents`/`tools[].functionDeclarations` body at an
-        // OpenAI-compat route, which 400s — so any user with a Gemini proxy or
-        // a regional endpoint lost tool calling along with everything else.
-        if (p == "gemini" || p == "google") {
-            if (base.contains(QLatin1String(":generateContent")))
-                return base;
-            static const QRegularExpression gem_ver(QStringLiteral("/v\\d+[a-zA-Z]*$"));
-            if (!gem_ver.match(base).hasMatch())
-                base += QStringLiteral("/v1beta");
-            return base + QStringLiteral("/models/") + model_ + QStringLiteral(":generateContent");
-        }
-
-        const QString suffix = (p == "anthropic") ? QStringLiteral("/messages") : QStringLiteral("/chat/completions");
-
-        // Already a full endpoint — use verbatim.
-        if (base.endsWith(suffix))
-            return base;
-
-        // Base already includes a version segment (e.g. ".../v1", ".../v1beta") —
-        // append only the suffix. Otherwise inject the default "/v1".
-        static const QRegularExpression re(QStringLiteral("/v\\d+[a-zA-Z]*$"));
-        if (re.match(base).hasMatch())
-            return base + suffix;
-        return base + QStringLiteral("/v1") + suffix;
-    }
-
-    if (p == "openai")
-        return "https://api.openai.com/v1/chat/completions";
-    if (p == "anthropic")
-        return "https://api.anthropic.com/v1/messages";
-    if (p == "gemini" || p == "google")
-        return "https://generativelanguage.googleapis.com/v1beta/models/" + model_ + ":generateContent";
-    if (p == "groq")
-        return "https://api.groq.com/openai/v1/chat/completions";
-    if (p == "deepseek")
-        return "https://api.deepseek.com/v1/chat/completions";
-    if (p == "openrouter")
-        return "https://openrouter.ai/api/v1/chat/completions";
-    if (p == "minimax")
-        return "https://api.minimax.io/v1/chat/completions";
-    if (p == "kimi")
-        return "https://api.moonshot.ai/v1/chat/completions";
-    if (p == "ollama")
-        return "http://localhost:11434/v1/chat/completions";
-    if (p == "xai")
-        return "https://api.x.ai/v1/chat/completions";
-    if (p == "aihubmix")
-        // Fallback for when the prefilled base_url was cleared; the custom-base_url
-        // branch above wins whenever it's set (incl. regional/proxy overrides).
-        return "https://aihubmix.com/v1/chat/completions";
-    return {};
+    // Everything else — default hosts, custom/proxy base_urls, and Gemini's
+    // native `:generateContent` path — is composed by ProviderCatalog.
+    //
+    // This used to be a hand-maintained copy of that function, kept in step by
+    // a comment. It drifted: ProviderCatalog grew a `default_base_url` fallback
+    // for providers whose host lives there rather than in the switch (AstraFlow,
+    // AstraFlow CN), while this copy special-cased only AIHubMix and returned an
+    // empty string for the other two. A user who cleared the prefilled base_url
+    // then got "No endpoint URL for provider: astraflow" from chat while every
+    // UI surface, reading ProviderCatalog, showed a working endpoint. Delegating
+    // removes the mirror rather than re-synchronising it.
+    return ProviderCatalog::chat_endpoint(p, base_url_, model_);
 }
 
 QMap<QString, QString> LlmService::get_headers() const {
@@ -545,7 +501,10 @@ LlmResponse LlmService::do_request(const QString& user_message, const std::vecto
             // grows as the model discovers tools, so a hoisted array would
             // freeze the catalogue at whatever round 1 could see.
             const int kMaxRounds = active_max_tool_rounds();
-            for (int round = 0; round < kMaxRounds; ++round) {
+            // Rounds cap the token spend; the deadline caps the wait. See ToolLoopBudget.
+            detail::ToolLoopBudget ant_budget(kMaxRounds);
+            for (int round = 0; !ant_budget.exhausted(); ++round) {
+                ant_budget.note_round();
                 const QJsonArray ant_tools = build_anthropic_tools(activated.names());
                 QJsonObject fu;
                 fu["model"] = model_;
@@ -577,28 +536,42 @@ LlmResponse LlmService::do_request(const QString& user_message, const std::vecto
                 // More tools requested — record the assistant turn, execute each
                 // tool_use block, and feed the results back for the next round.
                 loop_msgs.append(QJsonObject{{"role", "assistant"}, {"content", fcontent}});
-                QJsonArray more_results;
+                // Collect the round, then dispatch it together — read-only calls
+                // concurrently, writes as barriers (detail::execute_tool_calls).
+                std::vector<detail::PendingToolCall> calls;
                 for (const auto& block_val : fcontent) {
                     const QJsonObject block = block_val.toObject();
                     if (block["type"].toString() != "tool_use")
                         continue;
-                    const QString tid = block["id"].toString();
-                    const QString tname = block["name"].toString();
-                    const QJsonObject targs = block["input"].toObject();
-                    LOG_INFO(kLlmSvcTag, QString("Anthropic tool loop r%1: %2").arg(round).arg(tname));
-                    const QString bare = mcp::McpProvider::parse_openai_function_name(tname).second;
-                    detail::emit_tool_progress(bare, targs);
-                    auto tr = mcp::McpService::instance().execute_openai_function(tname, targs,
-                                                                                  /*allow_defer=*/true);
-                    detail::note_tool_activations(bare, targs, tr, activated);
-                    more_results.append(QJsonObject{{"type", "tool_result"},
-                                                    {"tool_use_id", tid},
-                                                    {"content", detail::encode_tool_result_for_llm(bare, tr)}});
+                    detail::PendingToolCall c;
+                    c.call_id = block["id"].toString();
+                    c.wire_name = block["name"].toString();
+                    c.args = block["input"].toObject();
+                    c.display = mcp::McpProvider::parse_openai_function_name(c.wire_name).second;
+                    LOG_INFO(kLlmSvcTag, QString("Anthropic tool loop r%1: %2").arg(round).arg(c.wire_name));
+                    detail::emit_tool_progress(c.display, c.args);
+                    calls.push_back(std::move(c));
+                }
+                const auto results = detail::execute_tool_calls(calls);
+                QJsonArray more_results;
+                for (std::size_t k = 0; k < calls.size(); ++k) {
+                    // tool_result blocks are appended in the model's order: an
+                    // Anthropic content array is positional, so completion order
+                    // must not leak into the transcript.
+                    detail::note_tool_activations(calls[k].display, calls[k].args, results[k], activated);
+                    more_results.append(
+                        QJsonObject{{"type", "tool_result"},
+                                    {"tool_use_id", calls[k].call_id},
+                                    {"content", detail::encode_tool_result_for_llm(calls[k].display, results[k])}});
                 }
                 loop_msgs.append(QJsonObject{{"role", "user"}, {"content", more_results}});
             }
-            if (resp.content.isEmpty() && resp.error.isEmpty())
-                resp.error = "Anthropic tool loop exceeded maximum rounds";
+            if (resp.content.isEmpty() && resp.error.isEmpty()) {
+                // Name the budget that ran out. "exceeded maximum rounds" was
+                // wrong the moment a second budget existed, and it told the user
+                // nothing actionable either way.
+                resp.error = "Anthropic tool loop ended without an answer — " + ant_budget.exhaustion_note();
+            }
         } else {
             resp.content = extract_anthropic_content_text(content);
         }
@@ -625,6 +598,7 @@ LlmResponse LlmService::do_request(const QString& user_message, const std::vecto
                 // tool and never chain a second. We now loop, re-attaching the tool
                 // set each round, until a text answer or the round cap.
                 const int kMaxRounds = active_max_tool_rounds();
+                detail::ToolLoopBudget gem_budget(kMaxRounds);
                 // Rebuilt per round, not hoisted: under Tool RAG the declared
                 // set grows as tool_list / tool_describe surface tools, and a
                 // hoisted array would pin the model to what round 1 could see.
@@ -646,23 +620,39 @@ LlmResponse LlmService::do_request(const QString& user_message, const std::vecto
                 // round; seeded with the initial response's parts.
                 QJsonArray model_parts = parts;
                 QJsonArray last_response_parts;
-                for (int round = 0; round < kMaxRounds; ++round) {
+                for (int round = 0; !gem_budget.exhausted(); ++round) {
+                    gem_budget.note_round();
                     fu_contents.append(QJsonObject{{"role", "model"}, {"parts", model_parts}});
 
-                    QJsonArray fn_response_parts;
+                    std::vector<detail::PendingToolCall> calls;
                     for (const auto& part_val : model_parts) {
                         const QJsonObject part = part_val.toObject();
                         if (!part.contains("functionCall"))
                             continue;
                         const QJsonObject fc = part["functionCall"].toObject();
-                        const QString fn_name = fc["name"].toString();
-                        const QJsonObject fn_args = fc["args"].toObject();
-                        LOG_INFO(kLlmSvcTag, QString("Gemini tool loop r%1: %2").arg(round).arg(fn_name));
-                        const QString bare = mcp::McpProvider::parse_openai_function_name(fn_name).second;
-                        detail::emit_tool_progress(bare, fn_args);
-                        auto tr = mcp::McpService::instance().execute_openai_function(fn_name, fn_args,
-                                                                                      /*allow_defer=*/true);
-                        detail::note_tool_activations(bare, fn_args, tr, activated);
+                        detail::PendingToolCall c;
+                        c.wire_name = fc["name"].toString();
+                        c.call_id = c.wire_name; // Gemini correlates by name, not by id
+                        // Gemini's declaration of this tool is a lossy translation
+                        // of its real schema: a free-form object parameter goes out
+                        // as a JSON-carrying STRING because Gemini's Schema cannot
+                        // express "object with arbitrary keys" (mcp/GeminiSchema.h).
+                        // Reconcile against the original schema so the handler gets
+                        // the object it declared, not a string it will read as {}.
+                        c.args = mcp::restore_gemini_call_args(
+                            mcp::McpService::instance().input_schema_for_function(c.wire_name),
+                            fc["args"].toObject());
+                        c.display = mcp::McpProvider::parse_openai_function_name(c.wire_name).second;
+                        LOG_INFO(kLlmSvcTag, QString("Gemini tool loop r%1: %2").arg(round).arg(c.wire_name));
+                        detail::emit_tool_progress(c.display, c.args);
+                        calls.push_back(std::move(c));
+                    }
+                    const auto results = detail::execute_tool_calls(calls);
+                    QJsonArray fn_response_parts;
+                    for (std::size_t k = 0; k < calls.size(); ++k) {
+                        const auto& c = calls[k];
+                        const auto& tr = results[k];
+                        detail::note_tool_activations(c.display, c.args, tr, activated);
                         // Gemini requires response to be an object — wrap strings under "result".
                         QJsonObject response_obj;
                         if (!tr.data.isNull() && !tr.data.isUndefined() && tr.data.isObject())
@@ -673,9 +663,11 @@ LlmResponse LlmService::do_request(const QString& user_message, const std::vecto
                             response_obj = tr.to_json();
                         // Same transcript budget as the other providers — this
                         // path re-posts `fu_contents` wholesale every round too.
-                        detail::fit_llm_payload(bare, response_obj);
+                        detail::fit_llm_payload(c.display, response_obj);
+                        // Parts are positional and must mirror the model's
+                        // functionCall order, not completion order.
                         fn_response_parts.append(QJsonObject{
-                            {"functionResponse", QJsonObject{{"name", fn_name}, {"response", response_obj}}}});
+                            {"functionResponse", QJsonObject{{"name", c.wire_name}, {"response", response_obj}}}});
                     }
                     fu_contents.append(QJsonObject{{"role", "user"}, {"parts", fn_response_parts}});
                     last_response_parts = fn_response_parts;
@@ -724,17 +716,28 @@ LlmResponse LlmService::do_request(const QString& user_message, const std::vecto
                 if (resp.content.isEmpty()) {
                     // Loop exhausted without a text turn — render the last round's
                     // function responses as readable text so the chat isn't blank.
-                    QString fallback;
+                    // This is raw tool output, NOT an answer: label it as such, say
+                    // why the loop stopped, and mark any payload that gets clipped.
+                    // A silently-truncated JSON blob presented as a reply is the
+                    // worst of both — neither the user nor a model reading the
+                    // transcript later can tell it is partial (§M4).
+                    constexpr int kFallbackPayloadChars = 4000;
+                    QString fallback = "*(the tool loop ended before the model produced an answer — " +
+                                       gem_budget.exhaustion_note() + ". Raw output from the last round below.)*\n";
                     for (const auto& pv : last_response_parts) {
                         const QJsonObject fr = pv.toObject()["functionResponse"].toObject();
                         const QString fn_name = fr["name"].toString();
                         const int sep = fn_name.indexOf("__");
                         const QString short_name = (sep >= 0) ? fn_name.mid(sep + 2) : fn_name;
-                        fallback +=
-                            "\n**Tool: " + short_name + "**\n" +
-                            QString::fromUtf8(QJsonDocument(fr["response"].toObject()).toJson(QJsonDocument::Compact))
-                                .left(4000) +
-                            "\n";
+                        QString payload = QString::fromUtf8(
+                            QJsonDocument(fr["response"].toObject()).toJson(QJsonDocument::Compact));
+                        if (payload.size() > kFallbackPayloadChars) {
+                            payload = payload.left(kFallbackPayloadChars) +
+                                      QStringLiteral("\n[... truncated %1 of %2 characters ...]")
+                                          .arg(payload.size() - kFallbackPayloadChars)
+                                          .arg(payload.size());
+                        }
+                        fallback += "\n**Tool: " + short_name + "**\n" + payload + "\n";
                     }
                     resp.content = fallback;
                 }

@@ -57,6 +57,9 @@ class McpProvider {
         QString description;
         bool has_handler = false; // sync OR async handler is set
         bool is_async = false;    // async_handler is set
+        int default_timeout_ms = kMcpDefaultTimeoutMs;
+        bool supports_async = false; // the explicit override flag, not the derived verdict
+        bool job_eligible = false;   // what supports_async_jobs() would answer
         bool enabled = true;
         bool is_destructive = false;
         AuthLevel auth_required = AuthLevel::None;
@@ -113,9 +116,16 @@ class McpProvider {
     /// they report through `ctx.on_progress` shows up in `job_status`.
     ToolResult call_tool_or_defer(const QString& name, const QJsonObject& args, int grace_ms = kMcpJobGraceMs);
 
-    /// True if `name` is registered, enabled, and eligible for the job protocol
-    /// (opted in AND has an async handler — a sync handler can't be backgrounded).
+    /// True if `name` is registered, enabled, and eligible for the job protocol.
+    ///
+    /// Requires an async handler (a sync one can't be backgrounded), plus
+    /// either an explicit `supports_async` or a `default_timeout_ms` above
+    /// `kMcpAsyncJobThresholdMs` — raising the budget IS the opt-in.
     bool supports_async_jobs(const QString& name) const;
+
+    /// The tool's declared hard budget, or the 30 s default if unknown.
+    /// Recorded on the job so `job_status` can report elapsed against it.
+    int effective_timeout_ms(const QString& name) const;
 
     // ── Phase 6.3: Authorization hook ──────────────────────────────────────
     /// Caller-supplied predicate that returns true iff the call should
